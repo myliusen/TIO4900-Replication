@@ -1,6 +1,10 @@
+import os
 import pandas as pd
 from typing import Tuple
 import numpy as np
+
+# Repo root: one level up from utils/
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_fred_md_data(filepath: str) -> Tuple[pd.DataFrame, pd.Series]:
@@ -127,6 +131,9 @@ def apply_fred_transformations(data: pd.DataFrame, transform_codes: pd.Series) -
 
 def get_fred_data(filepath: str, start: str, end: str) -> pd.DataFrame:
     """Convenience function to load and transform FRED-MD data in one step. """
+    # Resolve relative paths against repo root
+    if not os.path.isabs(filepath):
+        filepath = os.path.join(_REPO_ROOT, filepath)
     fred_md = apply_fred_transformations(*load_fred_md_data(filepath))
     return fred_md.loc[start:end]
 
@@ -134,7 +141,7 @@ def get_fred_data(filepath: str, start: str, end: str) -> pd.DataFrame:
 def get_yields(type: str, start: str, end: str, maturities: list) -> pd.DataFrame:
     """Load and preprocess KR yields data."""
     if type == 'kr':
-        yields = pd.read_csv('data/yield_panel_monthly_frequency_monthly_maturity.csv', index_col=0, parse_dates=True)
+        yields = pd.read_csv(os.path.join(_REPO_ROOT, 'data', 'yield_panel_monthly_frequency_monthly_maturity.csv'), index_col=0, parse_dates=True)
         yields.index.name = 'date'
     if type == "lw":
         pass # Implement loading for LW yields if needed
