@@ -11,18 +11,20 @@ class LinearModel:
     
     def predict(self, X):
         return self.model.predict(X)
-    
+
+
 class RandomWalkModel:
     def __init__(self):
-        pass
+        self.y_last = None
 
     def fit(self, X, y):
-        self.last_value = y[-1]
+        # Store the last observed y value
+        self.y_last = y[-1]
     
     def predict(self, X):
-        # Return array of same length as X
-        return np.full(X.shape[0], self.last_value)
-
+        # For Random Walk, always predict the last observed value
+        n_pred = X.shape[0] if hasattr(X, 'shape') else len(X)
+        return np.full(n_pred, self.y_last)
     
 class HistoricalMeanModel:
     def __init__(self):
