@@ -141,16 +141,38 @@ def get_fred_data(filepath: str, start: str, end: str) -> pd.DataFrame:
 def get_yields(type: str, start: str, end: str, maturities: list) -> pd.DataFrame:
     """Load and preprocess KR yields data."""
     if type == 'kr':
-        yields = pd.read_csv(os.path.join(_REPO_ROOT, 'data', 'yield_panel_monthly_frequency_monthly_maturity.csv'), index_col=0, parse_dates=True)
+        yields = pd.read_csv(os.path.join(_REPO_ROOT, 'data', 'kr_yields.csv'), index_col=0, parse_dates=True)
+        # Snap business-day month-ends to calendar month-ends (e.g. Sep 29 -> Sep 30)
+        yields.index = yields.index + pd.offsets.MonthEnd(0)
         yields.index.name = 'date'
-    if type == "lw":
-        pass # Implement loading for LW yields if needed
+
+    if type == 'lw':
+        yields = pd.read_csv(os.path.join(_REPO_ROOT, 'data', 'lw_yields.csv'), index_col=0, comment='%')
+        yields.index.name = 'date'
+        # parse date column – snap to calendar month-end
+        yields.index = pd.to_datetime(yields.index, format='%Y%m') + pd.offsets.MonthEnd(0)
+
+        yields = yields/100  # Convert from percentage points to decimals
+        # Rename columns to '1', '12', '24', ..., '120' (remove 'm' suffix and convert to string)
+        yields.columns = [str(int(col.strip().rstrip('m'))) for col in yields.columns]
+
+    if type == 'gsw':
+        yields = pd.read_csv(os.path.join(_REPO_ROOT, 'data', 'gsw_yields.csv'), index_col=0, parse_dates=True, skiprows=9)
+        # select only columns starting with SVENY and rename to '1', '12', '24', ..., '120' (remove 'SVENY' prefix and convert to string)
+        yields = yields[[col for col in yields.columns if col.startswith('SVENY')]]
+        # strip 0-padding and 'SVENY' prefix, convert to string
+        yields.columns = [col.strip().lstrip('SVENY').lstrip('0') for col in yields.columns]
+        # resample to month-end frequency, taking the last available observation in each month
+        yields = yields.resample('ME').last()
+        # snap to calendar month-end
+        yields.index = yields.index + pd.offsets.MonthEnd(0)
+        # rename columns to '1', '12', '24', ..., '120' instead of years 1, 2, 3, ..., 10
+        yields.columns = [str(int(col) * 12) for col in yields.columns]
+        # include day (end of month)
+        yields.index.name = 'date'
+        yields = yields/100  # Convert from percentage points to decimals
 
     yields = yields[maturities]
-    
-    # Snap business-day month-ends to calendar month-ends (e.g. Sep 29 -> Sep 30)
-    yields.index = yields.index + pd.offsets.MonthEnd(0)
-    yields.index.name = 'date'
 
     return yields.loc[start:end]
 

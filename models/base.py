@@ -26,6 +26,7 @@ class RandomWalkModel:
         n_pred = X.shape[0] if hasattr(X, 'shape') else len(X)
         return np.full(n_pred, self.y_last)
     
+    
 class HistoricalMeanModel:
     def __init__(self):
         pass
