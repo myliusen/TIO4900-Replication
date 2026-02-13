@@ -172,6 +172,9 @@ def get_yields(type: str, start: str, end: str, maturities: list) -> pd.DataFram
         yields.index.name = 'date'
         yields = yields/100  # Convert from percentage points to decimals
 
+    if type not in ['kr', 'lw', 'gsw']:
+        raise ValueError(f"Excess return calculation got unknown yield type: {type}")
+
     yields = yields[maturities]
 
     return yields.loc[start:end]
@@ -226,53 +229,6 @@ def get_forward_rates(yields: pd.DataFrame) -> pd.DataFrame:
     return forward_rates
 
 
-def get_excess_returns(yields: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate annual excess holding-period returns from zero-coupon yields.
-    
-    r_{t+12}(m) = log P_{t+12}(m-12) - log P_t(m)
-    rx_{t+12}(m) = r_{t+12}(m) - y_t(12)
-    
-    where m is maturity in months. The holding period is 12 months.
-    Excess returns are computed for maturities 24, 36, ..., 120 months
-    (since m-12 must be >= 12 for a meaningful bond to remain).
-    
-    Parameters:
-    -----------
-    yields : pd.DataFrame
-        Zero-coupon yields with monthly maturity columns (as strings: '1','12','24',...,'120')
-        
-    Returns:
-    --------
-    pd.DataFrame
-        Excess returns for maturities 24, 36, ..., 120 (indexed at t+12)
-    """
-    # Maturities for excess returns: need m >= 24 so that m-12 >= 12
-    excess_maturities = [str(i) for i in range(24, 121) if i % 12 == 0]
-    
-    excess_returns = pd.DataFrame(index=yields.index)
-    
-    for m_str in excess_maturities:
-        m = int(m_str)
-        m_prev = m - 12  # maturity after holding for 12 months
-        
-        # log P_t(m) = -(m/12) * y_t(m)
-        log_p_t_m = -(m / 12) * yields[m_str]
-        
-        # log P_{t+12}(m-12) = -((m-12)/12) * y_{t+12}(m-12)
-        log_p_t12_mprev = -(m_prev / 12) * yields[str(m_prev)].shift(-12)
-        
-        # Holding-period return: r_{t+12}(m) = log P_{t+12}(m-12) - log P_t(m)
-        hpr = log_p_t12_mprev - log_p_t_m
-        
-        # Risk-free rate over holding period: y_t(12) (the 12-month yield)
-        rf = yields['12']
-        
-        # Excess return: rx_{t+12}(m) = r_{t+12}(m) - y_t(12)
-        excess_returns[m_str] = hpr - rf
-    
-    return excess_returns
-
 def get_fredmd_grouping():
     """
     Return (ordered_series, series_to_group) for the earlier FRED-MD style
@@ -316,3 +272,77 @@ def get_fredmd_grouping():
         return 'Other'
     series_to_group = {s: label_group(s) for s in ordered_series}
     return ordered_series, series_to_group
+
+
+def get_excess_returns(yields: pd.DataFrame, horizon: int = 12) -> pd.DataFrame:
+    """
+    Calculate excess holding-period returns from zero-coupon yields.
+    
+    For horizon h (in months):
+        r_{t+h}(m) = log P_{t+h}(m-h) - log P_t(m)
+        rx_{t+h}(m) = r_{t+h}(m) - (h/12) * y_t(h)
+    
+    where log P_t(m) = -(m/12) * y_t(m).
+    
+    Parameters
+    ----------
+    yields : pd.DataFrame
+        Zero-coupon yields. Columns are maturity strings in months
+        ('1', '12', '23', '24', ..., '120').
+    horizon : int
+        Holding period in months.
+        horizon=12 : annual (original Bianchi). Needs maturities m and m-12.
+        horizon=1  : monthly (corrigendum). Needs maturities m and m-1.
+    
+    Returns
+    -------
+    pd.DataFrame
+        Excess returns indexed at time t (realized at t+h).
+        Columns are the original maturity m (in months, as string).
+    """
+    h = horizon
+    available = set(yields.columns)
+    
+    # Require the risk-free maturity
+    if str(h) not in available:
+        raise ValueError(
+            f"Yields must include the {h}-month maturity for the risk-free rate. "
+            f"Available: {sorted(available, key=lambda x: int(x))}"
+        )
+    
+    # Find maturities for which we can compute excess returns:
+    # need m > h  AND  str(m - h) in available columns
+    all_mats = sorted([int(c) for c in available])
+    valid_mats = [m for m in all_mats if m > h and str(m - h) in available]
+    
+    if not valid_mats:
+        raise ValueError(
+            f"No valid maturities for horizon={h}. Need maturity m > {h} "
+            f"with maturity m-{h} also available. "
+            f"Available maturities: {sorted(all_mats)}"
+        )
+    
+    # Risk-free return over h months: (h/12) * y_t(h)
+    rf = (h / 12) * yields[str(h)]
+    
+    # Build all columns at once to avoid fragmentation
+    columns = {}
+    for m in valid_mats:
+        m_after = m - h  # residual maturity after holding h months
+        
+        # log P_t(m) = -(m/12) * y_t(m)
+        log_p_t = -(m / 12) * yields[str(m)]
+        
+        # log P_{t+h}(m-h) = -((m-h)/12) * y_{t+h}(m-h)
+        log_p_th = -(m_after / 12) * yields[str(m_after)].shift(-h)
+        
+        # Holding-period return
+        hpr = log_p_th - log_p_t
+        
+        columns[str(m)] = hpr - rf
+    
+    excess_returns = pd.DataFrame(columns, index=yields.index)
+    
+    # Return only yearly maturities
+    yearly_cols = [str(m) for m in range(12, 121) if m % 12 == 0 and str(m) in excess_returns.columns]
+    return excess_returns[yearly_cols]

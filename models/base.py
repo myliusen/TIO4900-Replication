@@ -14,6 +14,13 @@ class LinearModel:
 
 
 class RandomWalkModel:
+    """Diagnostic only — predicts y[t] = y[t-1].
+    
+    With overlapping returns, this achieves high apparent R² due to
+    mechanical autocorrelation (~11/12 months shared), NOT genuine
+    predictive power. Use to check whether other models are simply
+    mimicking this persistence.
+    """
     def __init__(self):
         self.y_last = None
 
@@ -39,20 +46,21 @@ class HistoricalMeanModel:
     
 
 class PCABaselineModel:
-    def __init__(self, components=3):
+    def __init__(self, components=3, series='yields'):
         self.components = components
+        self.series = series
         self.pca = sklearn.decomposition.PCA(n_components=components)
         self.model = sklearn.linear_model.LinearRegression()
 
     def fit(self, X, y):
         # perform PCA on yields:
-        yields = X['yields']
+        yields = X[self.series]
         # Fit the PCA on the TRAINING set
         pca_scores = self.pca.fit_transform(yields)
         
         self.model.fit(pca_scores, y)
     
     def predict(self, X):
-        yields = X['yields']
+        yields = X[self.series]
         pca_scores = self.pca.transform(yields)
         return self.model.predict(pca_scores)
