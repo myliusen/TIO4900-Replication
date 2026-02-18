@@ -90,7 +90,6 @@ class LudvigsonNgModel:
     
 class LudvigsonNgBauerHamiltonSpec:
     def __init__(self, n_factors=8):
-        # We need enough components to get at least up to F8
         self.n_factors = max(n_factors, 8)
         self.pca_macro = sklearn.decomposition.PCA(n_components=self.n_factors)
         self.pca_yields = sklearn.decomposition.PCA(n_components=3)
