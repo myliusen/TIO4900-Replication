@@ -3,6 +3,7 @@ from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from itertools import product
+import sklearn.ensemble
 
 
 class ExtraTreesModel:
@@ -134,3 +135,51 @@ class ExtraTreesModel:
     def predict(self, X):
         X_transformed = self._build_features(X, fit=False)
         return self.model.predict(X_transformed)
+    
+
+class GroupPCARandomForest:
+    def __init__(self, components=3, series='yields', macro_pcs=1, rf_kwargs=None):
+        self.components = components
+        self.series = series
+        self.macro_pcs = macro_pcs
+        self.pca = sklearn.decomposition.PCA(n_components=components)
+        self.fred_pcas = {}  # category: PCA object
+        self.rf_kwargs = rf_kwargs if rf_kwargs is not None else {}
+        self.model = sklearn.ensemble.RandomForestRegressor(**self.rf_kwargs)
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        # PCA on yields/forwards
+        yields = X[self.series]
+        pca_scores = self.pca.fit_transform(yields)
+
+        # PCA on each macro category in 'fred'
+        fred = X['fred']
+        macro_cat_pcs = []
+        self.fred_pcas = {}
+        for cat in fred.columns.get_level_values(0).unique():
+            cat_df = fred[cat]
+            pca = sklearn.decomposition.PCA(n_components=self.macro_pcs)
+            pcs = pca.fit_transform(cat_df)
+            macro_cat_pcs.append(pcs)
+            self.fred_pcas[cat] = pca
+
+        macro_cat_pcs = np.hstack(macro_cat_pcs)  # shape (n_samples, n_cats * macro_pcs)
+
+        # Concatenate all features
+        features = np.concatenate([pca_scores, macro_cat_pcs], axis=1)
+        self.model.fit(features, y)
+
+    def predict(self, X):
+        yields = X[self.series]
+        pca_scores = self.pca.transform(yields)
+
+        fred = X['fred']
+        macro_cat_pcs = []
+        for cat, pca in self.fred_pcas.items():
+            cat_df = fred[cat]
+            pcs = pca.transform(cat_df)
+            macro_cat_pcs.append(pcs)
+        macro_cat_pcs = np.hstack(macro_cat_pcs)
+
+        features = np.concatenate([pca_scores, macro_cat_pcs], axis=1)
+        return self.model.predict(features)

@@ -5,69 +5,54 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import PredefinedSplit
 
 class LassoModel:
-    """
-    Lasso with internal time-series-safe hyperparameter tuning.
-    
-    At each expanding window step, fit() receives X_train, y_train
-    (all data up to time t). Within fit():
-      - Use the first 85% as sub-train, last 15% as validation
-      - Grid search over alpha on sub-train → evaluate on validation
-      - Refit on full X_train with best alpha
-    
-    No future data is ever used: the validation set is always the
-    most recent portion of the training window (temporal split).
-    """
-    
-    def __init__(self, alphas=None, series='forward'):
-        if alphas is None:
-            self.alphas = np.logspace(-5, 1, 30)  # 1e-5 to 10
-        else:
-            self.alphas = alphas
+    def __init__(self, alphas=None, series=None):
+        self.alphas = alphas if alphas is not None else np.logspace(-5, 1, 30)
         self.series = series
-        self.best_alpha_ = None
         self.model = None
-    
-    def fit(self, X, y):
-        X_sub = X[[self.series]].values if self.series else X.values
-        n = len(y)
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        # 1. Handle feature selection (subsetting columns)
+        X_sub = X[self.series] if self.series else X
         
-        # 85/15 temporal split — no shuffling
-        split = int(n * 0.85)
-        
-        # Need enough data in both splits
-        if split < 10 or (n - split) < 3:
-            # Too little data to tune — just use median alpha on full set
-            self.best_alpha_ = np.median(self.alphas)
-            self.model = sklearn.linear_model.Lasso(alpha=self.best_alpha_, max_iter=10000)
-            self.model.fit(X_sub, y)
-            return
-        
-        X_subtrain, X_val = X_sub[:split], X_sub[split:]
-        y_subtrain, y_val = y[:split], y[split:]
-        
-        # Grid search
+        # 2. DECIDE VALIDATION STRATEGY
+        if X_val is not None and y_val is not None:
+            # G-K MODE: Use provided external validation set
+            X_subtrain, y_subtrain = X_sub.values, y
+            X_v, y_v = (X_val[self.series].values if self.series else X_val.values), y_val
+        else:
+            # BIANCHI MODE: Internal 85/15 split
+            n = len(y)
+            split = int(n * 0.85)
+            X_vals = X_sub.values
+            X_subtrain, X_v = X_vals[:split], X_vals[split:]
+            y_subtrain, y_v = y[:split], y[split:]
+
+        # 3. GRID SEARCH (Now uses X_v, y_v regardless of where they came from)
         best_alpha = self.alphas[0]
         best_mse = np.inf
         
-        for alpha in self.alphas:
-            m = sklearn.linear_model.Lasso(alpha=alpha, max_iter=10000)
-            m.fit(X_subtrain, y_subtrain)
-            preds = m.predict(X_val)
-            mse = np.mean((y_val - preds) ** 2)
-            if mse < best_mse:
-                best_mse = mse
-                best_alpha = alpha
+        # Optimization: only tune if we have enough validation data
+        if len(y_v) >= 3:
+            for alpha in self.alphas:
+                m = sklearn.linear_model.Lasso(alpha=alpha, max_iter=10000)
+                m.fit(X_subtrain, y_subtrain)
+                mse = np.mean((y_v - m.predict(X_v)) ** 2)
+                if mse < best_mse:
+                    best_mse, best_alpha = mse, alpha
+        else:
+            best_alpha = np.median(self.alphas)
+
+        # 4. FINAL REFIT
+        # Refit on subtrain + internal val
+        X_final = np.vstack([X_subtrain, X_v])
+        y_final = np.concatenate([y_subtrain, y_v])
         
-        self.best_alpha_ = best_alpha
+        self.model = sklearn.linear_model.Lasso(alpha=best_alpha, max_iter=10000)
+        self.model.fit(X_final, y_final)
 
-        # Refit on full training set with best alpha
-        self.model = sklearn.linear_model.Lasso(alpha=self.best_alpha_, max_iter=10000)
-        self.model.fit(X_sub, y)
-    
     def predict(self, X):
-        X_sub = X[[self.series]].values if self.series else X.values
+        X_sub = X[self.series].values if self.series else X.values
         return self.model.predict(X_sub)
-
 
 class RidgeModel:
     """

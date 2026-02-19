@@ -2,48 +2,77 @@ import numpy as np
 from copy import deepcopy
 from tqdm import tqdm
 
-def expanding_window(model_class, X, y, dates, oos_start, gap=0):
+def expanding_window(model_class, X, y, dates, oos_start, 
+                     gap=0, val_len=None, refit_freq=1, coef_callback=None):
     """
-    Expanding-window OOS forecasting.
+    Unified Forecasting Engine.
     
     Parameters
     ----------
-    model_class : model with fit/predict interface
-    X : pd.DataFrame, features
-    y : np.array, target
-    dates : pd.DatetimeIndex
-    oos_start : pd.Timestamp
-    h : int, forecast horizon (default 12)
-    gap : int, number of periods to gap between training and prediction.
-          gap=0  : original Bianchi (train on y[:t], predict y[t])
-          gap=12 : corrigendum (train on y[:t-12], predict y[t])
-                   ensures no overlapping return in training uses
-                   future information relative to prediction time.
-    
-    Returns
-    -------
-    np.array of forecasts (NaN where no forecast is made)
+    gap : int
+        Number of months gap between sets to avoid overlapping return 
+        contamination. For h-month holding period returns, use gap = h-1.
+        (e.g., gap=11 for annual returns).
+    val_len : int, optional
+        If set (e.g., 144), uses a fixed rolling validation window of this length.
+        If None, model uses internal 85/15 split (Bianchi style).
+    refit_freq : int
+        1 = Refit every month (Bianchi).
+        12 = Refit every year (G-K / Fan et al.).
     """
-
     if y.ndim == 1:
         y_forecast = np.full(len(y), np.nan)
     else:
         y_forecast = np.full(y.shape, np.nan)
 
     oos_indices = np.where(dates >= oos_start)[0]
+    model = None
 
-    for t in tqdm(oos_indices):
-        model = deepcopy(model_class)
-        
-        train_end = t - gap  # with gap=0: train on [:t], with gap=12: train on [:t-12]
-        
-        if train_end < 2:  # need at least 2 training observations
-            continue
+    for i, t in enumerate(tqdm(oos_indices)):
+        # Trigger refit based on frequency
+        if i % refit_freq == 0:
+            current_model = deepcopy(model_class)
             
-        X_train = X.iloc[:train_end]
-        y_train = y[:train_end]
+            if val_len is not None:
+                # --- GU, KELLY, XIU (G-K) STYLE WITH DOUBLE GAP ---
+                # Predict at t
+                val_end = t - gap 
+                val_start = val_end - val_len
+                train_end = val_start - gap
+                
+                # Check if we have enough data for the requested val_len + double gap
+                if train_end < 20: 
+                    # FALLBACK: If early in sample, split usable data 70/30
+                    # Usable data is all data before the test-gap
+                    usable_total = t - gap
+                    # We need to fit [Train] + [Gap] + [Val] into usable_total
+                    # Let's allocate 70% of the 'non-gap' data to training
+                    train_size = int((usable_total - gap) * 0.7)
+                    train_end = train_size
+                    val_start = train_end + gap
+                    val_end = usable_total
 
-        model.fit(X_train, y_train)
+                X_train, y_train = X.iloc[:train_end], y[:train_end]
+                X_val, y_val     = X.iloc[val_start:val_end], y[val_start:val_end]
+                
+                # Model must support the fit(X, y, X_val, y_val) signature
+                current_model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+            else:
+                # --- BIANCHI STYLE (Refit every step, internal 85/15 split) ---
+                train_end = t - gap
+                X_train, y_train = X.iloc[:train_end], y[:train_end]
+                current_model.fit(X_train, y_train)
+            
+            model = current_model
+
+            if coef_callback is not None and hasattr(model, "model"):
+                # For PCABaselineModel, model.model is the sklearn LinearRegression
+                try:
+                    coef_callback(current_model.model.coef_)
+                except AttributeError:
+                    print("Warning: Model does not have .model.coef_ attribute for callback.")
+
+        # Prediction step
         pred = model.predict(X.iloc[[t]])
 
         if y.ndim == 1:
@@ -69,7 +98,7 @@ def oos_r2(y_true, y_forecast, benchmark='hist_mean', gap=0, **kwargs):
         'ewma'        - exponentially weighted moving average (specify `halflife` in kwargs)
         'rolling'     - rolling window mean (specify `window` in kwargs)
         'ar1'         - expanding-window AR(1)
-        'zero'        - constant zero forecast (pure EH null: no excess return)
+        'zero'        - constant zero forecast (pure EH null: no excess return, GKX benchmark)
     **kwargs : additional parameters for the benchmark
         halflife : int, EWMA half-life in periods (default 60)
         window   : int, rolling mean window in periods (default 60)

@@ -7,7 +7,7 @@ class CochranePiazzesiModel:
     def __init__(self):
         pass
 
-    def fit(self, X, y):
+    def fit(self, X, y, X_val=None, y_val=None):
         # Selects the 'forwards' sub-frame
         X_forwards = X['forward']
         # Only use the first 5 forward rates (12m, 24m, 36m, 48m, 60m) as in CP (2005)
