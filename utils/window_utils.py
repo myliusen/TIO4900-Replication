@@ -31,7 +31,11 @@ def expanding_window(model_class, X, y, dates, oos_start,
     for i, t in enumerate(tqdm(oos_indices)):
         # Trigger refit based on frequency
         if i % refit_freq == 0:
-            current_model = deepcopy(model_class)
+            if model is None:
+                current_model = deepcopy(model_class)
+            else:
+                # copy the last trained model (so it carries _fit_count and _best_params)
+                current_model = deepcopy(model)
             
             if val_len is not None:
                 # --- GU, KELLY, XIU (G-K) STYLE WITH DOUBLE GAP ---
