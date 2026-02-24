@@ -8,3 +8,5 @@ matplotlib
 tqdm
 xgboost
 ipykernel
+requests
+openpyxl
