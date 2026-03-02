@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from copy import deepcopy
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import ParameterGrid
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -33,14 +33,29 @@ class EarlyStopping:
             model.load_state_dict(self.best_state)
 
 
-def _l1_penalty(model, l1):
-    if not l1:
-        return 0.0
-    loss = 0.0
+def _compute_regularization(model, l1l2_macro, l1l2_fwd):
+    """
+    Applies Elastic Net (L1 + L2) regularization.
+    l1l2_macro: scalar lambda for the macro tower
+    l1l2_fwd:   scalar lambda for the fwd tower
+    """
+    l1_loss = 0.0
+    l2_loss = 0.0
+    
     for name, p in model.named_parameters():
-        if 'weight' in name:
-            loss = loss + p.abs().sum()
-    return l1 * loss
+        if 'weight' not in name:
+            continue
+            
+        # Determine which penalty to use based on layer name
+        is_macro = 'macro' in name.lower()
+        reg_lambda = l1l2_macro if is_macro else l1l2_fwd
+        
+        # L1: Sum of absolute values
+        l1_loss += reg_lambda * p.abs().sum()
+        # L2: Sum of squares (Ridge / Weight Decay)
+        l2_loss += reg_lambda * p.pow(2).sum()
+        
+    return l1_loss + l2_loss
 
 
 def _make_dataloader(X_list, y_tensor, batch_size, shuffle):
@@ -48,8 +63,6 @@ def _make_dataloader(X_list, y_tensor, batch_size, shuffle):
     X_list: list of torch tensors (all same length)
     returns: DataLoader that yields (xs_list, y)
     """
-    # concat inputs into single tensor with an input index if simpler —
-    # simpler approach: store tuple per sample: DataLoader(tensor_dataset) can take multiple tensors
     dataset = TensorDataset(*X_list, y_tensor)
     # drop_last to avoid singleton batch BN issues
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True)
@@ -75,78 +88,164 @@ def build_mlp(in_dim, out_dim, archi=(), dropout=0.0, final_activation=None, use
     return nn.Sequential(*layers)
 
 
+# ---------- generic trainer used by all public wrappers ----------
+def train_model(model, X_train_list, y_train, X_val_list, y_val,
+                epochs=500, lr=0.015, momentum=0.9, 
+                batch_size=32, patience=20, 
+                l1l2_macro=1e-4, l1l2_fwd=1e-4, seed=42):
+    
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    model.to(DEVICE)
+
+    # weight_decay=0 because we apply Custom Elastic Net in the loop
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum,
+                                weight_decay=0, nesterov=True)
+    criterion = nn.MSELoss()
+    es = EarlyStopping(patience=patience)
+
+    train_tensors = [t.to(DEVICE) for t in X_train_list]
+    val_tensors = [t.to(DEVICE) for t in X_val_list]
+    y_train, y_val = y_train.to(DEVICE), y_val.to(DEVICE)
+
+    train_dl = _make_dataloader(train_tensors, y_train, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(epochs):
+        model.train()
+        for batch in train_dl:
+            *batch_x, batch_y = batch
+            optimizer.zero_grad()
+            pred = model(*batch_x)
+            
+            mse = criterion(pred, batch_y)
+            reg = _compute_regularization(model, l1l2_macro, l1l2_fwd)
+            loss = mse + reg
+            
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(*val_tensors)
+            val_loss = float(criterion(val_pred, y_val).item())
+
+        if es.step(val_loss, model): break
+
+    es.restore(model)
+    return es.best_loss
+
+
+def _split_and_scale(X_arrays, y, val_frac=0.15):
+    n = len(y)
+    split = int(n * (1.0 - val_frac))
+
+    scalers = []
+    X_train_tensors = []
+    X_val_tensors = []
+
+    for X_arr in X_arrays:
+        scaler = StandardScaler()
+        # Fit on all available history to prevent stale scaling in expanding windows
+        scaler.fit(X_arr) 
+        
+        X_tr = scaler.transform(X_arr[:split])
+        X_va = scaler.transform(X_arr[split:])
+        scalers.append(scaler)
+        
+        X_train_tensors.append(torch.tensor(X_tr, dtype=torch.float32))
+        X_val_tensors.append(torch.tensor(X_va, dtype=torch.float32))
+
+    # Reshape and Scale Y to prevent L1 regularization from zeroing out weights
+    y_arr = y if y.ndim == 2 else y.reshape(-1, 1)
+    
+    y_scaler = StandardScaler()
+    y_scaler.fit(y_arr)
+    
+    y_tr = y_scaler.transform(y_arr[:split])
+    y_va = y_scaler.transform(y_arr[split:])
+    
+    y_train_t = torch.tensor(y_tr, dtype=torch.float32)
+    y_val_t = torch.tensor(y_va, dtype=torch.float32)
+
+    return X_train_tensors, y_train_t, X_val_tensors, y_val_t, scalers, y_scaler
+
+
+def grid_search(build_fn, X_arrays, y_array, param_grid, n_out, seed=42, **train_kwargs):
+    grid = list(ParameterGrid(param_grid))
+    best = (np.inf, None, None, None, None)
+    
+    for params in grid:
+        # Standardize parameter extraction (handles both single and dual grids)
+        dm = params.get('Dropout_Macro', params.get('Dropout', 0.0))
+        df = params.get('Dropout_Fwd', params.get('Dropout', 0.0))
+        lm = params.get('L1L2_Macro', params.get('l1l2', 1e-4))
+        lf = params.get('L1L2_Fwd', params.get('l1l2', 1e-4))
+
+        X_tr, y_tr, X_va, y_va, scalers, y_scaler = _split_and_scale(X_arrays, y_array)
+        
+        # build_fn now expects (dims, out, drop_m, drop_f)
+        model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dm, df)
+        
+        val_loss = train_model(model, X_tr, y_tr, X_va, y_va, 
+                               l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
+        
+        if val_loss < best[0]:
+            best = (val_loss, deepcopy(model), scalers, y_scaler, params)
+
+    # Refit logic
+    best_loss, _, best_scalers, best_y_scaler, best_params = best
+    dm = best_params.get('Dropout_Macro', best_params.get('Dropout', 0.0))
+    df = best_params.get('Dropout_Fwd', best_params.get('Dropout', 0.0))
+    lm = best_params.get('L1L2_Macro', best_params.get('l1l2', 1e-4))
+    lf = best_params.get('L1L2_Fwd', best_params.get('l1l2', 1e-4))
+    
+    X_tr, y_tr, X_va, y_va, _, _ = _split_and_scale(X_arrays, y_array)
+    model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dm, df)
+    train_model(model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
+    
+    return model, best_scalers, best_y_scaler, val_loss, best_params
+
+
 # ---------- compact architectures using builder ----------
 class ForwardRateNet(nn.Module):
-    def __init__(self, n_in, n_out, archi=(3,), dropout=0.0, use_bn=False):
+    def __init__(self, n_in, n_out, archi=(3,), dropout_fwd=0.0, use_bn=False):
         super().__init__()
-        # archi is now a tuple, e.g., (3,) or (5, 4, 3)
-        self.net = build_mlp(n_in, n_out, archi=archi, dropout=dropout, use_batchnorm=use_bn)
-        
+        # archi_fwd in the name helps _compute_regularization
+        self.fwd_net = build_mlp(n_in, n_out, archi=archi, dropout=dropout_fwd, use_batchnorm=use_bn)
     def forward(self, x):
-        return self.net(x)
+        return self.fwd_net(x)
 
 
 class MacroFwdHybridNet(nn.Module):
-    def __init__(self, n_macro, n_fwd, n_out, archi_macro=(32, 16, 8), archi_fwd=(3,), dropout=0.0, use_bn=True):
+    def __init__(self, n_macro, n_fwd, n_out, archi_macro=(32, 16, 8), archi_fwd=(3,), 
+                 dropout_macro=0.1, dropout_fwd=0.0, use_bn=True):
         super().__init__()
-        
-        # Tower 1: Macro Branch (The bottom part of diagram b)
-        # We output to the last element of archi_macro
         self.macro_tower = build_mlp(n_macro, archi_macro[-1], archi=archi_macro[:-1], 
-                                     dropout=dropout, use_batchnorm=False)
-        
-        # Tower 2: Forward Rate Branch (The top part of diagram b)
-        # Bianchi often uses a very shallow (3 nodes) branch here
+                                     dropout=dropout_macro, use_batchnorm=False)
         self.fwd_tower = build_mlp(n_fwd, archi_fwd[-1], archi=archi_fwd[:-1], 
-                                   dropout=dropout, use_batchnorm=False)
-        
-        # Merge layer
-        # Concatenates the outputs of both towers
-        merge_in_dim = archi_macro[-1] + archi_fwd[-1]
-        
-        # Final fully connected output layer
-        self.output_layer = nn.Linear(merge_in_dim, n_out)
-        
-        # Optional BN on the merged representation
-        self.bn_merge = nn.BatchNorm1d(merge_in_dim) if use_bn else nn.Identity()
+                                   dropout=dropout_fwd, use_batchnorm=False)
+        merge_dim = archi_macro[-1] + archi_fwd[-1]
+        self.output_layer = nn.Linear(merge_dim, n_out)
+        self.bn_merge = nn.BatchNorm1d(merge_dim) if use_bn else nn.Identity()
 
     def forward(self, x_macro, x_fwd):
-        # Process branches
-        h_macro = self.macro_tower(x_macro)
-        h_fwd = self.fwd_tower(x_fwd)
-        
-        # Concatenate on the feature dimension
-        merged = torch.cat([h_macro, h_fwd], dim=-1)
-        
-        # Final pass
+        merged = torch.cat([self.macro_tower(x_macro), self.fwd_tower(x_fwd)], dim=-1)
         return self.output_layer(self.bn_merge(merged))
 
 
 class GroupEnsembleNet(nn.Module):
-    def __init__(self, group_sizes, n_fwd, n_out, archi_group=(1,), archi_fwd=(3,), dropout=0.0, use_bn=True):
-        """
-        group_sizes: list of ints, number of features in each FRED group
-        n_fwd: number of forward rate features
-        """
+    def __init__(self, group_sizes, n_fwd, n_out, archi_group=(1,), archi_fwd=(3,), 
+                 dropout_macro=0.1, dropout_fwd=0.0, use_bn=True):
         super().__init__()
-        
-        # 1. Create a "Tower" for each Macro Group
-        # Bianchi often uses archi_group=(1,) -> reduces each group to a single factor
         self.macro_towers = nn.ModuleList([
-            build_mlp(g_size, archi_group[-1], archi=archi_group[:-1], 
-                      dropout=dropout, use_batchnorm=False)
-            for g_size in group_sizes
+            build_mlp(g, archi_group[-1], archi=archi_group[:-1], 
+                      dropout=dropout_macro, use_batchnorm=False) for g in group_sizes
         ])
-        
-        # 2. Create a "Tower" for Forward Rates
         self.fwd_tower = build_mlp(n_fwd, archi_fwd[-1], archi=archi_fwd[:-1], 
-                                   dropout=dropout, use_batchnorm=False)
-        
-        # 3. Final Output Layer
-        # Total incoming features = (Number of Macro Groups * latent_dim) + fwd_latent_dim
-        merge_in_dim = (len(group_sizes) * archi_group[-1]) + archi_fwd[-1]
-        self.output_layer = nn.Linear(merge_in_dim, n_out)
-        self.bn_merge = nn.BatchNorm1d(merge_in_dim) if use_bn else nn.Identity()
+                                   dropout=dropout_fwd, use_batchnorm=False)
+        merge_dim = (len(group_sizes) * archi_group[-1]) + archi_fwd[-1]
+        self.output_layer = nn.Linear(merge_dim, n_out)
+        self.bn_merge = nn.BatchNorm1d(merge_dim) if use_bn else nn.Identity()
 
     def forward(self, *inputs):
         """
@@ -167,79 +266,208 @@ class GroupEnsembleNet(nn.Module):
         
         return self.output_layer(self.bn_merge(merged))
 
-# ---------- generic trainer used by all public wrappers ----------
-def train_model(model, X_train_list, y_train, X_val_list, y_val,
-                epochs=500, lr=0.015, momentum=0.9, weight_decay=0.01,
-                batch_size=32, patience=20, l1=0.0, seed=42):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    model.to(DEVICE)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum,
-                                weight_decay=weight_decay, nesterov=True)
-    criterion = nn.MSELoss()
-    es = EarlyStopping(patience=patience)
+# ---------- public wrappers ----------
+class ForwardRateANN:
+    def __init__(self, archi=(3,), series='forward', do_grid_search=True, tune_every=60, **kwargs):
+        self.archi = archi
+        self.series = series
+        self.do_grid_search = do_grid_search
+        self.tune_every = tune_every
+        self.param_grid = kwargs.get('param_grid', {
+            'Dropout': [0.0, 0.1, 0.3], 
+            'l1l2': [1e-5, 1e-4]
+        })
+        self.train_params = kwargs
+        self._fit_count = 0
+        self._best_params = None
+        self._model = None
+        self._scalers = None
+        self._y_scaler = None
 
-    # create dataloaders
-    train_tensors = [t.to(DEVICE) for t in X_train_list]
-    val_tensors = [t.to(DEVICE) for t in X_val_list]
-    y_train = y_train.to(DEVICE)
-    y_val = y_val.to(DEVICE)
+    def fit(self, X, y):
+        X_arr = X[self.series].values
+        y_arr = np.array(y)
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
+        self._fit_count += 1
+        
+        def build_fn(dims, out, drop_m, drop_f): 
+            return ForwardRateNet(dims[0], out, archi=self.archi, dropout_fwd=drop_f)
 
-    train_dl = _make_dataloader(train_tensors, y_train, batch_size=batch_size, shuffle=True)
-
-    for epoch in range(epochs):
-        model.train()
-        for batch in train_dl:
-            *batch_x, batch_y = batch
-            batch_x = [bx.to(DEVICE) for bx in batch_x]
-            batch_y = batch_y.to(DEVICE)
-
-            optimizer.zero_grad()
-            pred = model(*batch_x)
-            loss = criterion(pred, batch_y) + _l1_penalty(model, l1)
-            loss.backward()
-            optimizer.step()
-
-        # validation
-        model.eval()
+        if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
+            self._model, self._scalers, self._y_scaler, _, self._best_params = grid_search(
+                build_fn, [X_arr], y_arr, self.param_grid, y_arr.shape[1], **self.train_params)
+        else:
+            lm = self._best_params.get('l1l2', 1e-4)
+            df = self._best_params.get('Dropout', 0.0)
+            X_tr, y_tr, X_va, y_va, self._scalers, self._y_scaler = _split_and_scale([X_arr], y_arr)
+            self._model = build_fn([X_arr.shape[1]], y_arr.shape[1], 0.0, df)
+            train_model(self._model, X_tr, y_tr, X_va, y_va, l1l2_fwd=lm, l1l2_macro=lm, **self.train_params)
+    
+    def predict(self, X):
+        X_scaled = self._scalers[0].transform(X[self.series].values)
+        self._model.eval()
         with torch.no_grad():
-            val_pred = model(*val_tensors)
-            val_loss = float(criterion(val_pred, y_val).item())
-
-        if es.step(val_loss, model):
-            break
-
-    es.restore(model)
-    return es.best_loss
+            pred_scaled = self._model(torch.tensor(X_scaled, dtype=torch.float32).to(DEVICE)).cpu().numpy()
+            return self._y_scaler.inverse_transform(pred_scaled).squeeze()
 
 
-# ---------- unified grid search ----------
-def grid_search(build_fn, X_arrays, y_array, param_grid, n_out, seed=42, **train_kwargs):
-    grid = list(ParameterGrid(param_grid))
-    best = (np.inf, None, None, None)  # (loss, model, scalers, params)
-    for params in grid:
-        dropout = params['Dropout']
-        l1l2 = params['l1l2']
+class HybridANN:
+    DEFAULT_GRID = {
+        'Dropout_Macro': [0.1, 0.3, 0.5],
+        'Dropout_Fwd':   [0.0],
+        'L1L2_Macro':    [0.01, 0.001],
+        'L1L2_Fwd':      [0.0001],
+    }
 
-        # split/scale
-        X_tr, y_tr, X_va, y_va, scalers = _split_and_scale(X_arrays, y_array)
-        model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dropout, params=params)
-        val_loss = train_model(model, X_tr, y_tr, X_va, y_va, l1=l1l2, seed=seed, **train_kwargs)
-        if val_loss < best[0]:
-            best = (val_loss, deepcopy(model), scalers, params)
+    def __init__(self, archi_macro=(32, 16, 8), archi_fwd=(3,), 
+                 do_grid_search=True, tune_every=60, **kwargs):
+        self.archi_macro = archi_macro
+        self.archi_fwd = archi_fwd
+        self.do_grid_search = do_grid_search
+        self.tune_every = tune_every
+        
+        self.param_grid = kwargs.get('param_grid', self.DEFAULT_GRID)
+        self.train_params = kwargs # lr, momentum, epochs, etc.
+        
+        self._model = None
+        self._scalers = None
+        self._y_scaler = None
+        self._fit_count = 0
+        self._best_params = None
 
-    # refit best on same split to mirror original behaviour
-    best_loss, _, best_scalers, best_params = best
-    dropout = best_params['Dropout']
-    l1l2 = best_params['l1l2']
-    X_tr, y_tr, X_va, y_va, scalers = _split_and_scale(X_arrays, y_array)
-    model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dropout, params=best_params)
-    val_loss = train_model(model, X_tr, y_tr, X_va, y_va, l1=l1l2, seed=seed, **train_kwargs)
-    return model, scalers, val_loss, best_params
+    def _select_features(self, X):
+        """Standardizes input into [macro_array, fwd_array]"""
+        return [X['fred'].values, X['forward'].values]
+
+    def fit(self, X, y):
+        inputs = self._select_features(X)
+        y_arr = np.array(y)
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
+        self._fit_count += 1
+        
+        def build_fn(dims, out, drop_m, drop_f):
+            return MacroFwdHybridNet(dims[0], dims[1], out, 
+                                     self.archi_macro, self.archi_fwd, 
+                                     drop_m, drop_f)
+
+        if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
+            self._model, self._scalers, self._y_scaler, _, self._best_params = grid_search(
+                build_fn, inputs, y_arr, self.param_grid, y_arr.shape[1], **self.train_params
+            )
+        else:
+            # Use found best params or fallback to kwargs
+            lm = self._best_params.get('L1L2_Macro', 1e-3)
+            lf = self._best_params.get('L1L2_Fwd', 1e-4)
+            dm = self._best_params.get('Dropout_Macro', 0.1)
+            df = self._best_params.get('Dropout_Fwd', 0.0)
+            
+            X_tr, y_tr, X_va, y_va, self._scalers, self._y_scaler = _split_and_scale(inputs, y_arr)
+            self._model = build_fn([a.shape[1] for a in inputs], y_arr.shape[1], dm, df)
+            
+            train_model(self._model, X_tr, y_tr, X_va, y_va, 
+                        l1l2_macro=lm, l1l2_fwd=lf, **self.train_params)
+
+    def predict(self, X):
+        raw = self._select_features(X)
+        scaled_macro = torch.tensor(self._scalers[0].transform(raw[0]), dtype=torch.float32).to(DEVICE)
+        scaled_fwd = torch.tensor(self._scalers[1].transform(raw[1]), dtype=torch.float32).to(DEVICE)
+        
+        self._model.eval()
+        with torch.no_grad():
+            pred_scaled = self._model(scaled_macro, scaled_fwd).cpu().numpy()
+            return self._y_scaler.inverse_transform(pred_scaled).squeeze()
+
+    def __repr__(self):
+        status = "Fitted" if self._model is not None else "Not Fitted"
+        return f"--- HybridANN ({status}) ---\nArchi Macro: {self.archi_macro}\nArchi Fwd: {self.archi_fwd}\n{str(self._model) if self._model else ''}"
+    
+
+class GroupEnsembleANN:
+    BIANCHI_GRID = {
+        'Dropout_Macro': [0.1, 0.3, 0.5],
+        'Dropout_Fwd':   [0.0],
+        'L1L2_Macro':    [0.01, 0.001],
+        'L1L2_Fwd':      [0.0001],
+    }
+
+    def __init__(self, archi_group=(1,), archi_fwd=(3,), do_grid_search=True, tune_every=60, **kwargs):
+        self.archi_group = archi_group
+        self.archi_fwd = archi_fwd
+        self.do_grid_search = do_grid_search
+        self.tune_every = tune_every
+        self.param_grid = kwargs.get('param_grid', self.BIANCHI_GRID)
+        self.train_params = kwargs
+        self._fit_count = 0
+        self._best_params = None
+        self._group_names = None
+        self._model = None
+        self._scalers = None
+        self._y_scaler = None
+
+    def _select_features(self, X):
+        if self._group_names is None:
+            self._group_names = X['fred'].columns.get_level_values(0).unique().tolist()
+        return [X['fred'][gn].values for gn in self._group_names] + [X['forward'].values]
+
+    def fit(self, X, y):
+        inputs = self._select_features(X)
+        y_arr = np.array(y)
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
+        self._fit_count += 1
+        
+        def build_fn(dims, out, drop_m, drop_f):
+            return GroupEnsembleNet(dims[:-1], dims[-1], out, self.archi_group, self.archi_fwd, drop_m, drop_f)
+
+        if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
+            self._model, self._scalers, self._y_scaler, _, self._best_params = grid_search(
+                build_fn, inputs, y_arr, self.param_grid, y_arr.shape[1], **self.train_params)
+        else:
+            lm, lf = self._best_params.get('L1L2_Macro', 1e-3), self._best_params.get('L1L2_Fwd', 1e-4)
+            dm, df = self._best_params.get('Dropout_Macro', 0.1), self._best_params.get('Dropout_Fwd', 0.0)
+            X_tr, y_tr, X_va, y_va, self._scalers, self._y_scaler = _split_and_scale(inputs, y_arr)
+            self._model = build_fn([a.shape[1] for a in inputs], y_arr.shape[1], dm, df)
+            train_model(self._model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, **self.train_params)
+
+    def predict(self, X):
+        raw = self._select_features(X)
+        scaled = [torch.tensor(s.transform(r), dtype=torch.float32).to(DEVICE) for s, r in zip(self._scalers, raw)]
+        self._model.eval()
+        with torch.no_grad():
+            pred_scaled = self._model(*scaled).cpu().numpy()
+            return self._y_scaler.inverse_transform(pred_scaled).squeeze()
+
+# WGNN
+
+# ---------- 1. Custom Volatility Scaler ----------
+class VolatilityScaler:
+    """
+    Scales target variables purely by their standard deviation (volatility) to match 
+    Equation 12 of the paper, without mean-centering like StandardScaler.
+    """
+    def __init__(self):
+        self.scale_ = None
+        
+    def fit(self, X):
+        # Calculate standard deviation along the time axis (available training data)
+        self.scale_ = np.std(X, axis=0)
+        # Prevent division by zero just in case
+        self.scale_ = np.where(self.scale_ == 0, 1e-8, self.scale_)
+        return self
+        
+    def transform(self, X):
+        return X / self.scale_
+        
+    def inverse_transform(self, X):
+        return X * self.scale_
 
 
-def _split_and_scale(X_arrays, y, val_frac=0.15):
+# ---------- 2. WLS Split & Scale Helper ----------
+def _split_and_scale_wgnn(X_arrays, y, val_frac=0.15):
+    """Modified split & scale that uses VolatilityScaler for y targets."""
     n = len(y)
     split = int(n * (1.0 - val_frac))
 
@@ -248,302 +476,148 @@ def _split_and_scale(X_arrays, y, val_frac=0.15):
     X_val_tensors = []
 
     for X_arr in X_arrays:
-        scaler = MinMaxScaler(feature_range=(-1, 1))
-        X_tr = scaler.fit_transform(X_arr[:split])
-        X_va = scaler.transform(X_arr[split:])
+        scaler = StandardScaler()
+        scaler.fit(X_arr) 
+        X_tr, X_va = scaler.transform(X_arr[:split]), scaler.transform(X_arr[split:])
         scalers.append(scaler)
         X_train_tensors.append(torch.tensor(X_tr, dtype=torch.float32))
         X_val_tensors.append(torch.tensor(X_va, dtype=torch.float32))
 
     y_arr = y if y.ndim == 2 else y.reshape(-1, 1)
-    y_train_t = torch.tensor(y_arr[:split], dtype=torch.float32)
-    y_val_t = torch.tensor(y_arr[split:], dtype=torch.float32)
+    
+    # Use Volatility Scaler for targets to implement WLS MSE Loss implicitly
+    y_scaler = VolatilityScaler()
+    y_scaler.fit(y_arr)
+    
+    y_tr, y_va = y_scaler.transform(y_arr[:split]), y_scaler.transform(y_arr[split:])
+    y_train_t = torch.tensor(y_tr, dtype=torch.float32)
+    y_val_t = torch.tensor(y_va, dtype=torch.float32)
 
-    return X_train_tensors, y_train_t, X_val_tensors, y_val_t, scalers
+    return X_train_tensors, y_train_t, X_val_tensors, y_val_t, scalers, y_scaler
 
 
-class ForwardRateANN:
-    DEFAULT_GRID = {
-        'Dropout': [0.0, 0.1, 0.3, 0.5],
-        'l1l2':    [1e-5, 1e-4, 1e-3],
+# ---------- 3. WLS Grid Search Helper ----------
+def grid_search_wgnn(build_fn, X_arrays, y_array, param_grid, n_out, seed=42, **train_kwargs):
+    grid = list(ParameterGrid(param_grid))
+    best = (np.inf, None, None, None, None)
+    
+    for params in grid:
+        dm = params.get('Dropout_Macro', params.get('Dropout', 0.0))
+        df = params.get('Dropout_Fwd', params.get('Dropout', 0.0))
+        lm = params.get('L1L2_Macro', params.get('l1l2', 1e-4))
+        lf = params.get('L1L2_Fwd', params.get('l1l2', 1e-4))
+
+        X_tr, y_tr, X_va, y_va, scalers, y_scaler = _split_and_scale_wgnn(X_arrays, y_array)
+        
+        model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dm, df)
+        model.set_sigma(y_scaler.scale_) # Pass volatility vector to the network
+        
+        val_loss = train_model(model, X_tr, y_tr, X_va, y_va, 
+                               l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
+        
+        if val_loss < best[0]:
+            best = (val_loss, deepcopy(model), scalers, y_scaler, params)
+
+    best_loss, _, best_scalers, best_y_scaler, best_params = best
+    dm = best_params.get('Dropout_Macro', best_params.get('Dropout', 0.0))
+    df = best_params.get('Dropout_Fwd', best_params.get('Dropout', 0.0))
+    lm = best_params.get('L1L2_Macro', best_params.get('l1l2', 1e-4))
+    lf = best_params.get('L1L2_Fwd', best_params.get('l1l2', 1e-4))
+    
+    X_tr, y_tr, X_va, y_va, _, _ = _split_and_scale_wgnn(X_arrays, y_array)
+    model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dm, df)
+    model.set_sigma(best_y_scaler.scale_)
+    
+    train_model(model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
+    
+    return model, best_scalers, best_y_scaler, val_loss, best_params
+
+
+# ---------- 4. New WGNN Architecture ----------
+class WeightedGroupEnsembleNet(nn.Module):
+    """
+    Extends GroupEnsembleNet by incorporating the historical volatility scaling
+    natively into the architecture to produce the predicted unscaled return.
+    """
+    def __init__(self, group_sizes, n_fwd, n_out, archi_group=(1,), archi_fwd=(3,), 
+                 dropout_macro=0.1, dropout_fwd=0.0, use_bn=True):
+        super().__init__()
+        # Internal core architecture maps inputs to scaled predictions
+        self.core_net = GroupEnsembleNet(group_sizes, n_fwd, n_out, archi_group, archi_fwd, 
+                                         dropout_macro, dropout_fwd, use_bn)
+        # Register the volatilities as a buffer so it saves cleanly with model states
+        self.register_buffer('sigma', torch.ones(n_out))
+        
+    def set_sigma(self, sigma_np):
+        """Injects \hat{\sigma}_t from the available historical training pool."""
+        self.sigma = torch.tensor(sigma_np, dtype=torch.float32).view(-1)
+        
+    def forward(self, *inputs):
+        """Outputs the predicted volatility-scaled return (\widetilde{rx}) used during MSE training."""
+        return self.core_net(*inputs)
+        
+    def predict_unscaled(self, *inputs):
+        """Equation 12 logic: Re-scales to raw returns via (\widetilde{rx} * \hat{\sigma})."""
+        scaled_pred = self.forward(*inputs)
+        return scaled_pred * self.sigma
+
+
+# ---------- 5. WGNN Model Wrapper ----------
+class WeightedGroupEnsembleANN:
+    BIANCHI_GRID = {
+        'Dropout_Macro': [0.1, 0.3, 0.5],
+        'Dropout_Fwd':   [0.0],
+        'L1L2_Macro':    [0.01, 0.001],
+        'L1L2_Fwd':      [0.0001],
     }
 
-    def __init__(self, archi=(3,), series='forward',
-                 do_grid_search=True, param_grid=None,
-                 epochs=500, lr=0.015, momentum=0.9, weight_decay=0.01,
-                 batch_size=32, patience=20, tune_every=60, seed=42,
-                 dropout=0.0, l1l2=1e-4):
-
-        self.archi = archi # Store tuple here
-        self.series = series
-        self.do_grid_search = do_grid_search
-        self.param_grid = param_grid or self.DEFAULT_GRID
-        self.epochs = epochs
-        self.lr = lr
-        self.momentum = momentum
-        self.weight_decay = weight_decay
-        self.batch_size = batch_size
-        self.patience = patience
-        self.tune_every = tune_every
-        self.seed = seed
-        self.dropout = dropout
-        self.l1l2 = l1l2
-
-        self._model = None
-        self._scalers = None
-        self._fit_count = 0
-        self._best_params = None
-
-
-    def _select_features(self, X):
-        if hasattr(X, 'columns') and hasattr(X.columns, 'get_level_values'):
-            source = X.columns.get_level_values(0)
-            return X.loc[:, source == self.series].values
-        return X.values if hasattr(X, 'values') else np.array(X)
-
-
-    def _build_model(self, n_inputs, n_out, dropout):
-        # Pass the fixed architecture tuple to the network
-        return ForwardRateNet(n_inputs, n_out,
-                              archi=self.archi,
-                              dropout=dropout,
-                              use_bn=True)
-
-    def fit(self, X, y):
-        X_arr = self._select_features(X)
-        y_arr = y if isinstance(y, np.ndarray) else np.array(y)
-        n_out = y_arr.shape[1] if y_arr.ndim == 2 else 1
-
-        self._fit_count += 1
-        train_kwargs = dict(
-            epochs=self.epochs, lr=self.lr, momentum=self.momentum,
-            weight_decay=self.weight_decay,
-            batch_size=self.batch_size, patience=self.patience
-        )
-
-        if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
-            print(f"Grid search triggered for ForwardRateANN (Fit #{self._fit_count})...")
-
-            # We fix archi, but grid search optimizes Dropout and L1/L2
-            def build_fn(n_inputs_list, n_out_, dropout_val, params=None):
-                return self._build_model(n_inputs_list[0], n_out_, dropout_val)
-
-            self._model, self._scalers, _, self._best_params = grid_search(
-                build_fn, [X_arr], y_arr, self.param_grid, n_out,
-                seed=self.seed, **train_kwargs
-            )
-        else:
-            # Use previously found best hyperparameters or defaults
-            dropout = self._best_params['Dropout'] if self._best_params else self.dropout
-            l1l2 = self._best_params['l1l2'] if self._best_params else self.l1l2
-
-            X_tr, y_tr, X_va, y_va, self._scalers = _split_and_scale([X_arr], y_arr)
-            self._model = self._build_model(X_arr.shape[1], n_out, dropout)
-
-            train_model(self._model, X_tr, y_tr, X_va, y_va,
-                        l1=l1l2, seed=self.seed, **train_kwargs)
-
-    def predict(self, X):
-        X_arr = self._select_features(X)
-        X_scaled = self._scalers[0].transform(X_arr)
-
-        X_t = torch.tensor(X_scaled, dtype=torch.float32).to(DEVICE)
-
-        self._model.eval()
-        with torch.no_grad():
-            pred = self._model(X_t).cpu().numpy()
-
-        return pred.squeeze()
-    
-    
-class HybridANN:
-    DEFAULT_GRID = {
-        'Dropout': [0.0, 0.1, 0.3, 0.5],
-        'l1l2':    [1e-5, 1e-4, 1e-3],
-    }
-
-    def __init__(self, archi_macro=(32, 16, 8), archi_fwd=(3,), 
-                 do_grid_search=True, param_grid=None,
-                 epochs=500, lr=0.015, momentum=0.9, weight_decay=0.01,
-                 batch_size=32, patience=20, tune_every=60, seed=42,
-                 dropout=0.0, l1l2=1e-4):
-        
-        self.archi_macro = archi_macro
-        self.archi_fwd = archi_fwd
-        
-        self.do_grid_search = do_grid_search
-        self.param_grid = param_grid or self.DEFAULT_GRID
-        
-        # Training Parameters
-        self.epochs = epochs
-        self.lr = lr
-        self.momentum = momentum
-        self.weight_decay = weight_decay
-        self.batch_size = batch_size
-        self.patience = patience
-        self.tune_every = tune_every
-        self.seed = seed
-        
-        # Current best/default hyperparameters
-        self.dropout = dropout
-        self.l1l2 = l1l2
-
-        self._model = None
-        self._scalers = None 
-        self._fit_count = 0
-        self._best_params = None
-
-    def _select_features(self, X):
-        """Extracts the macro and forward components from the MultiIndex DataFrame."""
-        macro = X['fred'].values
-        fwd = X['forward'].values
-        return [macro, fwd]
-
-    def _build_model(self, n_macro, n_fwd, n_out, dropout):
-        return MacroFwdHybridNet(n_macro, n_fwd, n_out, 
-                                 archi_macro=self.archi_macro,
-                                 archi_fwd=self.archi_fwd,
-                                 dropout=dropout,
-                                 use_bn=True)
-
-    def fit(self, X, y):
-        inputs_list = self._select_features(X) # [macro_arr, fwd_arr]
-        y_arr = y.values if hasattr(y, 'values') else np.array(y)
-        n_out = y_arr.shape[1] if y_arr.ndim == 2 else 1
-
-        self._fit_count += 1
-        
-        train_kwargs = dict(
-            epochs=self.epochs, lr=self.lr, momentum=self.momentum,
-            weight_decay=self.weight_decay,
-            batch_size=self.batch_size, patience=self.patience
-        )
-
-        if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
-            print(f"Grid search triggered for HybridANN (Fit #{self._fit_count})...")
-            
-            def build_fn(in_dims, out_dim, drop_val, params=None):
-                return self._build_model(in_dims[0], in_dims[1], out_dim, drop_val)
-
-            self._model, self._scalers, _, self._best_params = grid_search(
-                build_fn, inputs_list, y_arr, self.param_grid, n_out,
-                seed=self.seed, **train_kwargs
-            )
-        else:
-            # Use current best params
-            dropout = self._best_params['Dropout'] if self._best_params else self.dropout
-            l1l2 = self._best_params['l1l2'] if self._best_params else self.l1l2
-
-            X_tr, y_tr, X_va, y_va, self._scalers = _split_and_scale(inputs_list, y_arr)
-            
-            self._model = self._build_model(inputs_list[0].shape[1], 
-                                            inputs_list[1].shape[1], 
-                                            n_out, dropout)
-            
-            train_model(self._model, X_tr, y_tr, X_va, y_va, 
-                        l1=l1l2, seed=self.seed, **train_kwargs)
-
-    def predict(self, X):
-        macro_raw, fwd_raw = self._select_features(X)
-        
-        # Scaling
-        macro_s = self._scalers[0].transform(macro_raw)
-        fwd_s = self._scalers[1].transform(fwd_raw)
-        
-        t_macro = torch.tensor(macro_s, dtype=torch.float32).to(DEVICE)
-        t_fwd = torch.tensor(fwd_s, dtype=torch.float32).to(DEVICE)
-        
-        self._model.eval()
-        with torch.no_grad():
-            pred = self._model(t_macro, t_fwd).cpu().numpy()
-        return pred.squeeze()
-    
-
-class GroupEnsembleANN:
-    DEFAULT_GRID = {
-        'Dropout': [0.0, 0.1, 0.3, 0.5],
-        'l1l2':    [1e-5, 1e-4, 1e-3],
-    }
-
-    def __init__(self, archi_group=(1,), archi_fwd=(3,),
-                 do_grid_search=True, param_grid=None,
-                 epochs=500, lr=0.015, momentum=0.9, weight_decay=0.01,
-                 batch_size=32, patience=20, tune_every=60, seed=42):
-        
+    def __init__(self, archi_group=(1,), archi_fwd=(3,), do_grid_search=True, tune_every=60, **kwargs):
         self.archi_group = archi_group
         self.archi_fwd = archi_fwd
         self.do_grid_search = do_grid_search
-        self.param_grid = param_grid or self.DEFAULT_GRID
-        self.epochs, self.lr, self.momentum = epochs, lr, momentum
-        self.weight_decay, self.batch_size, self.patience = weight_decay, batch_size, patience
-        self.tune_every, self.seed = tune_every, seed
-
-        self._model = None
-        self._scalers = None
+        self.tune_every = tune_every
+        self.param_grid = kwargs.get('param_grid', self.BIANCHI_GRID)
+        self.train_params = kwargs
         self._fit_count = 0
         self._best_params = None
         self._group_names = None
+        self._model = None
+        self._scalers = None
+        self._y_scaler = None
 
     def _select_features(self, X):
-        """Returns a list of arrays: [group1, group2, ..., groupK, forward]"""
-        # 1. Identify FRED groups using the second level of the MultiIndex
-        fred_df = X['fred']
         if self._group_names is None:
-            self._group_names = fred_df.columns.get_level_values(0).unique().tolist()
-        
-        # Extract each macro group
-        inputs = [fred_df[gn].values for gn in self._group_names]
-        
-        # 2. Append the forward rates
-        inputs.append(X['forward'].values)
-        return inputs
-
-    def _build_model(self, group_sizes_list, n_out, dropout):
-        # group_sizes_list contains [size_g1, size_g2, ..., size_fwd]
-        macro_sizes = group_sizes_list[:-1]
-        fwd_size = group_sizes_list[-1]
-        return GroupEnsembleNet(macro_sizes, fwd_size, n_out, 
-                                archi_group=self.archi_group, 
-                                archi_fwd=self.archi_fwd, 
-                                dropout=dropout)
+            self._group_names = X['fred'].columns.get_level_values(0).unique().tolist()
+        return [X['fred'][gn].values for gn in self._group_names] + [X['forward'].values]
 
     def fit(self, X, y):
-        inputs_list = self._select_features(X)
-        y_arr = y.values if hasattr(y, 'values') else np.array(y)
-        n_out = y_arr.shape[1] if y_arr.ndim == 2 else 1
+        inputs = self._select_features(X)
+        y_arr = np.array(y)
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
         self._fit_count += 1
-
-        train_kwargs = dict(epochs=self.epochs, lr=self.lr, momentum=self.momentum,
-                            weight_decay=self.weight_decay, batch_size=self.batch_size, 
-                            patience=self.patience)
+        
+        def build_fn(dims, out, drop_m, drop_f):
+            return WeightedGroupEnsembleNet(dims[:-1], dims[-1], out, self.archi_group, self.archi_fwd, drop_m, drop_f)
 
         if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
-            print(f"Grid search triggered for GroupEnsembleANN...")
-            def build_fn(dims, out, drop, params=None):
-                return self._build_model(dims, out, drop)
-            
-            self._model, self._scalers, _, self._best_params = grid_search(
-                build_fn, inputs_list, y_arr, self.param_grid, n_out, seed=self.seed, **train_kwargs
-            )
+            self._model, self._scalers, self._y_scaler, _, self._best_params = grid_search_wgnn(
+                build_fn, inputs, y_arr, self.param_grid, y_arr.shape[1], **self.train_params)
         else:
-            drop = self._best_params['Dropout'] if self._best_params else 0.0
-            l1 = self._best_params['l1l2'] if self._best_params else 1e-4
-            X_tr, y_tr, X_va, y_va, self._scalers = _split_and_scale(inputs_list, y_arr)
-            self._model = self._build_model([arr.shape[1] for arr in inputs_list], n_out, drop)
-            train_model(self._model, X_tr, y_tr, X_va, y_va, l1=l1, seed=self.seed, **train_kwargs)
+            lm, lf = self._best_params.get('L1L2_Macro', 1e-3), self._best_params.get('L1L2_Fwd', 1e-4)
+            dm, df = self._best_params.get('Dropout_Macro', 0.1), self._best_params.get('Dropout_Fwd', 0.0)
+            X_tr, y_tr, X_va, y_va, self._scalers, self._y_scaler = _split_and_scale_wgnn(inputs, y_arr)
+            
+            self._model = build_fn([a.shape[1] for a in inputs], y_arr.shape[1], dm, df)
+            self._model.set_sigma(self._y_scaler.scale_) # Pass estimated \hat{\sigma}_t
+            
+            train_model(self._model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, **self.train_params)
 
     def predict(self, X):
-        inputs_raw = self._select_features(X)
-        scaled_tensors = []
-        for i, arr in enumerate(inputs_raw):
-            scaled = self._scalers[i].transform(arr)
-            scaled_tensors.append(torch.tensor(scaled, dtype=torch.float32).to(DEVICE))
-        
+        raw = self._select_features(X)
+        scaled = [torch.tensor(s.transform(r), dtype=torch.float32).to(DEVICE) for s, r in zip(self._scalers, raw)]
         self._model.eval()
         with torch.no_grad():
-            pred = self._model(*scaled_tensors).cpu().numpy()
-        return pred.squeeze()
-
-    def __repr__(self):
-        status = "Fitted" if self._model is not None else "Not Fitted"
-        return f"--- GroupEnsembleANN ({status}) ---\nGroups: {self._group_names}\n{str(self._model) if self._model else ''}"
+            # Utilize the architecture's native scaling method to get unscaled bond predictions
+            pred_unscaled = self._model.predict_unscaled(*scaled).cpu().numpy()
+            return pred_unscaled.squeeze()

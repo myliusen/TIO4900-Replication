@@ -136,6 +136,7 @@ class GroupLassoModel:
         X_vals = X.values if hasattr(X, 'values') else np.array(X)
         return self.model.predict(X_vals)
 
+
 class BianchiElasticNet:
     """
     Faithful reimplementation of Bianchi's ElasticNet_Exog_Plain,
