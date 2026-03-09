@@ -71,6 +71,9 @@ def run_expanding_multi_seed(
     benchmark="hist_mean",
 ):
     out = {}
+    results_dir = os.path.join("artifacts", "results", run_name)
+    os.makedirs(results_dir, exist_ok=True)
+
     for seed in tqdm(seeds, desc="seeds", position=0, leave=True, dynamic_ncols=True):
         set_global_seed(seed)
         model = model_factory(seed)
@@ -82,7 +85,8 @@ def run_expanding_multi_seed(
                 seed=seed,
                 refit_i=refit_i,
                 t_index=t_index,
-                date_value=date_value
+                date_value=date_value,
+                extra_meta={"val_loss": float(getattr(model, "_last_val_loss", np.nan))}
             )
 
         y_forecast = wu.expanding_window(
@@ -96,7 +100,31 @@ def run_expanding_multi_seed(
         )
         r2 = wu.oos_r2(y, y_forecast, benchmark=benchmark)
         out[seed] = {"forecast": y_forecast, "r2": r2}
+
+        # Persist forecast array so results can be reloaded without replaying
+        joblib.dump(
+            {"forecast": y_forecast, "r2": r2},
+            os.path.join(results_dir, f"seed_{seed:04d}.joblib"),
+            compress=3
+        )
+
     return out
+
+
+def load_results(run_name: str, seeds=None, root_dir: str = "artifacts/results") -> dict:
+    """Load persisted per-seed forecast dicts, returning same structure as run_expanding_multi_seed."""
+    results_dir = os.path.join(root_dir, run_name)
+    pattern = os.path.join(results_dir, "seed_*.joblib")
+    files = sorted(glob.glob(pattern))
+
+    out = {}
+    for path in files:
+        seed = int(os.path.basename(path).replace("seed_", "").replace(".joblib", ""))
+        if seeds is not None and seed not in set(seeds):
+            continue
+        out[seed] = joblib.load(path)
+    return out
+
 
 def build_snapshot_index(
     run_name: str,
@@ -134,11 +162,12 @@ def build_snapshot_index(
             "date": pd.to_datetime(meta.get("date")),
             "model_path": model_path,
             "meta_path": meta_path,
+            "val_loss": meta.get("val_loss", np.nan),
         })
 
     if not rows:
         return pd.DataFrame(columns=[
-            "run_name", "seed", "refit_i", "t_index", "date", "model_path", "meta_path"
+            "run_name", "seed", "refit_i", "t_index", "date", "model_path", "meta_path", "val_loss"
         ])
 
     df = pd.DataFrame(rows).sort_values(["seed", "refit_i"]).reset_index(drop=True)

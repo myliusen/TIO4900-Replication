@@ -203,7 +203,7 @@ def grid_search(build_fn, X_arrays, y_array, param_grid, n_out, seed=42, **train
     model = build_fn([arr.shape[1] for arr in X_arrays], n_out, dm, df)
     train_model(model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
     
-    return model, best_scalers, best_y_scaler, val_loss, best_params
+    return model, best_scalers, best_y_scaler, best_loss, best_params
 
 
 # ---------- compact architectures using builder ----------
@@ -284,6 +284,7 @@ class ForwardRateANN:
         self._model = None
         self._scalers = None
         self._y_scaler = None
+        self._last_val_loss = None
 
     def fit(self, X, y):
         X_arr = X[self.series].values
@@ -296,14 +297,15 @@ class ForwardRateANN:
             return ForwardRateNet(dims[0], out, archi=self.archi, dropout_fwd=drop_f)
 
         if self.do_grid_search and (self._fit_count - 1) % self.tune_every == 0:
-            self._model, self._scalers, self._y_scaler, _, self._best_params = grid_search(
+            self._model, self._scalers, self._y_scaler, self._last_val_loss, self._best_params = grid_search(
                 build_fn, [X_arr], y_arr, self.param_grid, y_arr.shape[1], **self.train_params)
+
         else:
             lm = self._best_params.get('l1l2', 1e-4)
             df = self._best_params.get('Dropout', 0.0)
             X_tr, y_tr, X_va, y_va, self._scalers, self._y_scaler = _split_and_scale([X_arr], y_arr)
             self._model = build_fn([X_arr.shape[1]], y_arr.shape[1], 0.0, df)
-            train_model(self._model, X_tr, y_tr, X_va, y_va, l1l2_fwd=lm, l1l2_macro=lm, **self.train_params)
+            self._last_val_loss = train_model(self._model, X_tr, y_tr, X_va, y_va, l1l2_fwd=lm, l1l2_macro=lm, **self.train_params)
     
     def predict(self, X):
         X_scaled = self._scalers[0].transform(X[self.series].values)
@@ -530,7 +532,7 @@ def grid_search_wgnn(build_fn, X_arrays, y_array, param_grid, n_out, seed=42, **
     
     train_model(model, X_tr, y_tr, X_va, y_va, l1l2_macro=lm, l1l2_fwd=lf, seed=seed, **train_kwargs)
     
-    return model, best_scalers, best_y_scaler, val_loss, best_params
+    return model, best_scalers, best_y_scaler, best_loss, best_params
 
 
 # ---------- 4. New WGNN Architecture ----------
@@ -549,15 +551,15 @@ class WeightedGroupEnsembleNet(nn.Module):
         self.register_buffer('sigma', torch.ones(n_out))
         
     def set_sigma(self, sigma_np):
-        """Injects \hat{\sigma}_t from the available historical training pool."""
+        """Injects estimated sigma_t from available historical training data."""
         self.sigma = torch.tensor(sigma_np, dtype=torch.float32).view(-1)
         
     def forward(self, *inputs):
-        """Outputs the predicted volatility-scaled return (\widetilde{rx}) used during MSE training."""
+        """Outputs the predicted volatility-scaled return  used during MSE training."""
         return self.core_net(*inputs)
         
     def predict_unscaled(self, *inputs):
-        """Equation 12 logic: Re-scales to raw returns via (\widetilde{rx} * \hat{\sigma})."""
+        """Equation 12 logic: Re-scales to raw returns."""
         scaled_pred = self.forward(*inputs)
         return scaled_pred * self.sigma
 

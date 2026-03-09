@@ -58,7 +58,7 @@ def expanding_window(model_class, X, y, dates, oos_start,
             pred = model.predict(X.iloc[[t]])
 
         if y.ndim == 1:
-            y_forecast[t] = pred
+            y_forecast[t] = pred[-1] if isinstance(pred, np.ndarray) else pred
         else:
             y_forecast[t, :] = pred.flatten()
 
