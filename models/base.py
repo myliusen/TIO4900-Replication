@@ -17,9 +17,9 @@ class RandomWalkModel:
     """Diagnostic only — predicts y[t] = y[t-1].
     
     With overlapping returns, this achieves high apparent R² due to
-    mechanical autocorrelation (~11/12 months shared), NOT genuine
-    predictive power. Use to check whether other models are simply
-    mimicking this persistence.
+    mechanical autocorrelation (~11/12 months shared) and lookahead,
+    NOT genuine predictive power. Use to check whether other models
+    are simply mimicking this persistence.
     """
     def __init__(self):
         self.y_last = None
@@ -138,7 +138,6 @@ class PCABaselineModelMacroGroups:
         self.pca = sklearn.decomposition.PCA(n_components=components)
         self.fred_pcas = {}  # Will hold one PCA per macro category
         
-        # Scaler for final features (CRITICAL for Lasso to apply penalty fairly across PCs)
         self.scaler_features = sklearn.preprocessing.StandardScaler()
         
         if self.lasso:

@@ -51,7 +51,11 @@ def expanding_window(model_class, X, y, dates, oos_start,
                 except AttributeError:
                     print("Warning: Model does not have .model.coef_ attribute for callback.")
 
-        pred = model.predict(X.iloc[[t]])
+        # Use sequence architectures' own prediction method if available
+        if hasattr(model, "predict_at"):
+            pred = model.predict_at(X, t)
+        else:
+            pred = model.predict(X.iloc[[t]])
 
         if y.ndim == 1:
             y_forecast[t] = pred

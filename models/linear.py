@@ -14,20 +14,12 @@ class LassoModel:
         # 1. Handle feature selection (subsetting columns)
         X_sub = X[self.series] if self.series else X
         
-        # 2. DECIDE VALIDATION STRATEGY
-        if X_val is not None and y_val is not None:
-            # G-K MODE: Use provided external validation set
-            X_subtrain, y_subtrain = X_sub.values, y
-            X_v, y_v = (X_val[self.series].values if self.series else X_val.values), y_val
-        else:
-            # BIANCHI MODE: Internal 85/15 split
-            n = len(y)
-            split = int(n * 0.85)
-            X_vals = X_sub.values
-            X_subtrain, X_v = X_vals[:split], X_vals[split:]
-            y_subtrain, y_v = y[:split], y[split:]
+        n = len(y)
+        split = int(n * 0.85)
+        X_vals = X_sub.values
+        X_subtrain, X_v = X_vals[:split], X_vals[split:]
+        y_subtrain, y_v = y[:split], y[split:]
 
-        # 3. GRID SEARCH (Now uses X_v, y_v regardless of where they came from)
         best_alpha = self.alphas[0]
         best_mse = np.inf
         
@@ -112,29 +104,79 @@ class RidgeModel:
 
 
 class GroupLassoModel:
-    def __init__(self, alpha=0.01, groups=None):
-        self.alpha = alpha
-        self.groups = groups
+    """
+    Group Lasso with internal 85/15 temporal validation split for alpha tuning.
+    
+    Uses StandardScaler on features. The `groups` parameter is a per-feature
+    integer array (e.g., [0,0,0,1,1,2,2,2,...]) that maps each column to its group.
+    Internally converted to group_sizes list for skglm.GroupLasso.
+    """
+    
+    def __init__(self, alphas=None, groups=None):
+        if alphas is None:
+            self.alphas = np.logspace(-4, 1, 30)
+        else:
+            self.alphas = alphas
+        self.groups = groups  # per-feature integer label array
+        self.model = None
+        self.scaler = None
+        self.best_alpha_ = None
+
+    def _get_group_sizes(self):
+        """Convert per-feature group labels to ordered group sizes list for skglm."""
+        _, counts = np.unique(self.groups, return_counts=True)
+        return counts.tolist()
 
     def fit(self, X, y):
-        # Extract integer group codes from the MultiIndex
-        groups = self.groups
-        
-        # skglm expects a list of group sizes (contiguous blocks),
-        # but groups_as_array gives per-column integer labels.
-        # skglm.GroupLasso accepts either format depending on version.
-        # With skglm, pass the number of features per group as a list:
-        import numpy as np
-        _, counts = np.unique(groups, return_counts=True)
-        group_sizes = counts.tolist()
-
         X_vals = X.values if hasattr(X, 'values') else np.array(X)
-        self.model = skglm.GroupLasso(alpha=self.alpha, groups=group_sizes)
-        self.model.fit(X_vals, y)
+        y_vals = np.array(y).ravel()
+        
+        group_sizes = self._get_group_sizes()
+        
+        # Scale features
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X_vals)
+        
+        n = len(y_vals)
+        split = int(n * 0.85)
+        
+        # Fallback if not enough data for a proper split
+        if split < 10 or (n - split) < 3:
+            self.best_alpha_ = np.median(self.alphas)
+            self.model = skglm.GroupLasso(alpha=self.best_alpha_, groups=group_sizes)
+            self.model.fit(X_scaled, y_vals)
+            return
+        
+        X_subtrain, X_val = X_scaled[:split], X_scaled[split:]
+        y_subtrain, y_val = y_vals[:split], y_vals[split:]
+        
+        # Grid search over alpha
+        best_alpha = self.alphas[0]
+        best_mse = np.inf
+        
+        for alpha in self.alphas:
+            try:
+                m = skglm.GroupLasso(alpha=alpha, groups=group_sizes)
+                m.fit(X_subtrain, y_subtrain)
+                preds = m.predict(X_val)
+                mse = np.mean((y_val - preds) ** 2)
+                if mse < best_mse:
+                    best_mse = mse
+                    best_alpha = alpha
+            except Exception:
+                # Some alpha values may cause convergence issues; skip them
+                continue
+        
+        self.best_alpha_ = best_alpha
+        
+        # Refit on full training set (subtrain + val) with best alpha
+        self.model = skglm.GroupLasso(alpha=self.best_alpha_, groups=group_sizes)
+        self.model.fit(X_scaled, y_vals)
     
     def predict(self, X):
         X_vals = X.values if hasattr(X, 'values') else np.array(X)
-        return self.model.predict(X_vals)
+        X_scaled = self.scaler.transform(X_vals)
+        return self.model.predict(X_scaled)
 
 
 class BianchiElasticNet:
