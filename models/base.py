@@ -214,7 +214,7 @@ class PCABaselineModelMacroGroupsHYPERGRID:
         
         # Hyperparameter grids
         self.alphas = alphas if alphas is not None else[1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0]
-        self.macro_pcs_list = macro_pcs_list if macro_pcs_list is not None else [1, 2, 3]
+        self.macro_pcs_list = macro_pcs_list if macro_pcs_list is not None else [1]
         
         # Track best parameters found during fit
         self.best_alpha_ = None
