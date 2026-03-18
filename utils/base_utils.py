@@ -346,3 +346,82 @@ def get_excess_returns(yields: pd.DataFrame, horizon: int = 12) -> pd.DataFrame:
     # Return only yearly maturities
     yearly_cols = [str(m) for m in range(12, 121) if m % 12 == 0 and str(m) in excess_returns.columns]
     return excess_returns[yearly_cols]
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+
+def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model_name="Model"):
+    """
+    Constructs a Welch-Goyal style CSSED plot.
+    
+    Parameters:
+    -----------
+    y_true : np.array
+        The actual excess returns.
+    y_forecast : np.array
+        The OOS forecasts from your model.
+    dates : pd.Series / pd.DatetimeIndex
+        The dates corresponding to the returns.
+    oos_start : pd.Timestamp
+        The date your OOS period actually begins.
+    secondary_start : pd.Timestamp, optional
+        The date for the right-hand zero-point (e.g., 2000-01-31).
+    """
+    # 1. Align data and filter for OOS period
+    df = pd.DataFrame({
+        'realized': y_true,
+        'forecast': y_forecast
+    }, index=dates)
+    
+    oos_df = df.loc[oos_start:].copy()
+    
+    # 2. Generate Historical Mean Benchmark (Expanding Window)
+    # We use the same logic as the paper: mean of all returns available up to t-1
+    full_series = pd.Series(y_true, index=dates)
+    oos_df['hist_mean_bench'] = [full_series.loc[:d].iloc[:-1].mean() for d in oos_df.index]
+    
+    # 3. Calculate Squared Errors
+    oos_df['error_model'] = (oos_df['realized'] - oos_df['forecast'])**2
+    oos_df['error_bench'] = (oos_df['realized'] - oos_df['hist_mean_bench'])**2
+    
+    # 4. Calculate CSSED: Cumulative (SE_benchmark - SE_model)
+    # An increase means the model is beating the benchmark
+    oos_df['cssed'] = (oos_df['error_bench'] - oos_df['error_model']).cumsum()
+    
+    # 5. Plotting
+    sns.set_style("whitegrid")
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Primary Line (Solid black/blue is standard for OOS)
+    sns.lineplot(data=oos_df, x=oos_df.index, y='cssed', ax=ax1, color='black', linewidth=2)
+    
+    ax1.axhline(0, color='red', linestyle='--', alpha=0.6) # The "Null" Benchmark line
+    ax1.set_ylabel(f'Cumulative SSE Difference (Zero at {oos_start.year})', fontsize=12)
+    ax1.set_xlabel('Year', fontsize=12)
+    ax1.set_title(f'OOS Performance: {model_name} vs. Historical Mean', fontsize=14)
+
+    # 6. Secondary Axis (The Welch-Goyal Vertical Shift)
+    if secondary_start and secondary_start in oos_df.index:
+        val_at_secondary = oos_df.loc[secondary_start, 'cssed']
+        
+        # We create a twin axis
+        ax2 = ax1.twinx()
+        
+        # To make the right axis 0 at the secondary_start, we align the limits
+        # by shifting the primary limits by the value at the secondary start
+        y1_min, y1_max = ax1.get_ylim()
+        ax2.set_ylim(y1_min - val_at_secondary, y1_max - val_at_secondary)
+        
+        ax2.set_ylabel(f'CSSED (Zero at {secondary_start.year})', fontsize=12)
+        ax2.axhline(0, color='gray', linestyle=':', alpha=0.5) # Zero line for the right axis
+        
+        # Mark the secondary zero point on the x-axis
+        ax1.axvline(secondary_start, color='blue', linestyle='--', alpha=0.3)
+        ax1.text(secondary_start, y1_max, f' Start {secondary_start.year}', 
+                 verticalalignment='top', color='blue', fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
