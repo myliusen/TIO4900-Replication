@@ -2,6 +2,8 @@ import os
 import pandas as pd
 from typing import Tuple
 import numpy as np
+import statsmodels.api as sm
+from scipy.stats import t as tstat
 
 # Repo root: one level up from utils/
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -425,3 +427,24 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
 
     plt.tight_layout()
     plt.show()
+
+def RSZ_Signif(y_true, y_forecast):
+    # Copied from the replication code of Bianchi et al. (2021):
+    # Compute conidtional mean forecast
+    y_condmean = np.divide(y_true.cumsum(), (np.arange(y_true.size)+1))
+
+    # lag by one period
+    y_condmean = np.insert(y_condmean, 0, np.nan)
+    y_condmean = y_condmean[:-1]
+    y_condmean[np.isnan(y_forecast)] = np.nan
+
+    # Compute f-measure
+    f = np.square(y_true-y_condmean)-np.square(y_true-y_forecast)  \
+        + np.square(y_condmean-y_forecast)
+
+    # Regress f on a constant
+    x = np.ones(np.shape(f))
+    model = sm.OLS(f, x, missing='drop', hasconst=True)
+    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+
+    return 1-tstat.cdf(results.tvalues[0], results.nobs-1)
